@@ -1,0 +1,18 @@
+[project]
+name = "learning-habits"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.11"
+dependencies = [
+    "matplotlib>=3.11.0",
+    "numpy>=2.4.6",
+    "pandas>=3.0.3",
+    "scikit-learn>=1.9.0",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+    "jupyterlab>=4.6.0",
+    "notebook>=7.6.0",
+]
