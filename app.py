@@ -1,245 +1,179 @@
-# Materials Research Agent — all tools from the notebooks in one place.
+# Materials-Science Paper Chat — agentic RAG with claim-level citations.
+# Chat naturally, like NotebookLM. Every node in the retrieve -> grade -> gap-check
+# -> generate -> verify loop (agentic_rag.py) is streamed to the UI as an inspectable
+# Step, and every claim in the final answer shows its verdict from the faithfulness
+# check, not just a source pointer.
 # Run: uv run uvicorn app:app --reload
 
 import pysqlite3 as _pysqlite3  # chromadb needs this on some systems
 import sys
 sys.modules["sqlite3"] = _pysqlite3
 
-import ast
-import operator
-import os
 import uuid
-import requests
-import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 load_dotenv()
 
 import chainlit as cl
-from langchain.agents import create_agent
-from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_tavily import TavilySearch
-from langchain_chroma import Chroma
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFDirectoryLoader
-from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.store.memory import InMemoryStore
-from langgraph.config import get_store
 
-# ── LLM ───────────────────────────────────────────────────────────────────────
+import agentic_rag
 
-llm = ChatOpenAI(model="gpt-5.4-mini", temperature=0)
+# ── Build the graph once; each chat turn gets its own thread_id (see the
+# checkpointer note in agentic_rag.build_graph) so loop state from one question
+# never bleeds into grading/gap-checking for the next. ─────────────────────────
+_graph = agentic_rag.build_graph()
 
-# ── Tool 1: safe calculator ───────────────────────────────────────────────────
-
-_OPS = {
-    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
-    ast.Div: operator.truediv, ast.Pow: operator.pow, ast.Mod: operator.mod,
-    ast.USub: operator.neg, ast.UAdd: operator.pos,
+_STEP_TYPE = {
+    "retrieve": "retrieval",
+    "grade_docs": "llm",
+    "identify_gaps": "llm",
+    "generate": "llm",
+    "verify": "llm",
+}
+_STEP_LABEL = {
+    "retrieve": "retrieve",
+    "grade_docs": "grade chunks",
+    "identify_gaps": "check for gaps",
+    "generate": "draft cited answer",
+    "verify": "verify claims against sources",
 }
 
-def _safe_eval(node):
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-        return node.value
-    if isinstance(node, ast.BinOp):
-        return _OPS[type(node.op)](_safe_eval(node.left), _safe_eval(node.right))
-    if isinstance(node, ast.UnaryOp):
-        return _OPS[type(node.op)](_safe_eval(node.operand))
-    raise ValueError("Unsupported expression")
 
-@tool
-def calculator(expression: str) -> str:
-    """Evaluate an arithmetic expression and return the result.
-    Supports + - * / ** % and parentheses, e.g. '23847 * 198 + 4471'."""
-    try:
-        return str(_safe_eval(ast.parse(expression, mode="eval").body))
-    except Exception as e:
-        return f"Calculator error: {e}"
-
-# ── Tool 2: web search ────────────────────────────────────────────────────────
-
-web_search = TavilySearch(max_results=3)
-
-# ── Tool 3: arXiv paper abstract ──────────────────────────────────────────────
-
-@tool
-def get_paper_abstract(title: str) -> str:
-    """Look up an academic paper by its title on arXiv and return its abstract,
-    authors, and year. Best for ML, physics, and materials-science papers."""
-    try:
-        r = requests.get(
-            "http://export.arxiv.org/api/query",
-            params={"search_query": f'ti:"{title}"', "start": 0, "max_results": 1},
-            timeout=20,
+# ── Per-node trace formatting — what shows up inside each Step in the UI ──────
+def _describe(node_name: str, out: dict) -> tuple[str, str]:
+    if node_name == "retrieve":
+        query = out["queries_tried"][-1]
+        docs = out["retrieved_docs"]
+        body = "\n".join(
+            f"  [{d['chunk_id']}] {d['paper']} p.{d['page']}  (distance={d['distance']})"
+            for d in docs
         )
-        r.raise_for_status()
-        ns = {"a": "http://www.w3.org/2005/Atom"}
-        entry = ET.fromstring(r.text).find("a:entry", ns)
-        if entry is None:
-            return f"No arXiv paper found matching '{title}'."
-        found_title = entry.findtext("a:title", default="", namespaces=ns).strip()
-        summary = entry.findtext("a:summary", default="", namespaces=ns).strip()
-        year = entry.findtext("a:published", default="", namespaces=ns)[:4]
-        authors = ", ".join(
-            a.findtext("a:name", default="", namespaces=ns)
-            for a in entry.findall("a:author", ns)[:3]
+        return query, f"{len(docs)} chunk(s) retrieved:\n{body}"
+
+    if node_name == "grade_docs":
+        if not out:
+            return "(no new chunks)", "skipped — every retrieved chunk was already graded on an earlier pass"
+        kept = {d["chunk_id"] for d in out["relevant_docs"]}
+        lines = [
+            f"  [{cid}] {'kept — relevant' if cid in kept else 'dropped — not relevant'}"
+            for cid in out["graded_ids"]
+        ]
+        return f"grading {len(out['graded_ids'])} chunk(s)", "\n".join(lines)
+
+    if node_name == "identify_gaps":
+        gap = out["gap"]
+        if gap["sufficient"]:
+            return "is the context enough to answer?", "sufficient — moving to generate"
+        return (
+            "is the context enough to answer?",
+            f"insufficient — missing: {gap['missing_aspect']}\nrewritten query: {out['query']!r}",
         )
-        return f"{found_title} ({year}) — {authors}\n\n{summary}"
-    except Exception as e:
-        return f"arXiv error: {e}"
 
-# ── Tool 4: current time ──────────────────────────────────────────────────────
+    if node_name == "generate":
+        lines = [
+            f"  - {c['text']}  [{', '.join(c['chunk_ids']) or 'uncited'}]"
+            for c in out["claims"]
+        ]
+        return "drafting cited answer from relevant context", "\n".join(lines)
 
-@tool
-def get_current_time(timezone: str = "UTC") -> str:
-    """Get today's date and current time. Call this FIRST whenever the user asks
-    about 'recent', 'latest', or 'current' things. Pass an IANA timezone like
-    'Asia/Tokyo' (defaults to UTC)."""
-    try:
-        now = datetime.now(ZoneInfo(timezone))
-    except Exception:
-        return f"Unknown timezone '{timezone}'. Use an IANA name like 'Asia/Tokyo'."
-    return now.strftime("%Y-%m-%d %H:%M:%S %Z (%A)")
+    if node_name == "verify":
+        lines = [f"  {c['verdict']}: {c['claim']}\n      {c['explanation']}" for c in out["citations"]]
+        return "checking each claim against its cited span", "\n".join(lines)
 
-# ── Tools 5 & 6: long-term memory across sessions ────────────────────────────
+    return "", str(out)
 
-_store = InMemoryStore(
-    index={"embed": OpenAIEmbeddings(model="text-embedding-3-small"), "dims": 1536}
-)
 
-@tool
-def remember_finding(note: str) -> str:
-    """Save an important research finding to long-term memory so it can be
-    recalled in future conversations."""
-    get_store().put(("findings",), str(uuid.uuid4()), {"text": note})
-    return "Saved to long-term memory."
+# ── Final chat message formatting — inline citation markers + a sources panel,
+# plus an explicit flag for any claim the verifier didn't fully back. ─────────
+def _format_answer(state: dict) -> str:
+    citations = state["citations"]
+    if not citations:
+        return state["answer"] or "I couldn't find anything relevant in the corpus for that."
 
-@tool
-def recall_findings(query: str) -> str:
-    """Search long-term memory for previously saved findings relevant to the query.
-    Call this at the start of a research task to reuse past knowledge."""
-    hits = get_store().search(("findings",), query=query, limit=3)
-    return "\n".join(f"- {h.value['text']}" for h in hits) or "No relevant findings."
+    footnote_order: list[str] = []
+    footnote_index: dict[str, int] = {}
+    for c in citations:
+        for cid in c["chunk_ids"]:
+            if cid not in footnote_index:
+                footnote_index[cid] = len(footnote_order) + 1
+                footnote_order.append(cid)
 
-# ── Tool 7: RAG over local PDF corpus ────────────────────────────────────────
-
-_PDF_DIR = "papers"
-_DB_DIR = "./chroma_db"
-_COLLECTION = "materials_papers"
-
-def _init_vectorstore() -> Chroma | None:
-    if not os.path.isdir(_PDF_DIR):
-        print(f"[RAG] No '{_PDF_DIR}/' directory — search_papers tool disabled.")
-        return None
-    emb = OpenAIEmbeddings(model="text-embedding-3-small")
-    vs = Chroma(collection_name=_COLLECTION, embedding_function=emb, persist_directory=_DB_DIR)
-    if vs._collection.count() == 0:
-        print("[RAG] Indexing PDFs (one-time cost)…")
-        pages = PyPDFDirectoryLoader(_PDF_DIR).load()
-        if not pages:
-            print(f"[RAG] No PDFs found in {_PDF_DIR}/ — search_papers tool disabled.")
-            return None
-        chunks = RecursiveCharacterTextSplitter(
-            chunk_size=1000, chunk_overlap=200, add_start_index=True,
-        ).split_documents(pages)
-        vs.add_documents(chunks)
-        print(f"[RAG] Indexed {len(chunks)} chunks.")
-    else:
-        print(f"[RAG] Loaded existing index: {vs._collection.count()} chunks.")
-    return vs
-
-_vectorstore = _init_vectorstore()
-
-def _format_docs(docs) -> str:
-    return "\n\n".join(
-        f"[{os.path.basename(d.metadata.get('source', '?'))} p.{d.metadata.get('page', '?')}]\n{d.page_content}"
-        for d in docs
+    prose = " ".join(
+        c["claim"] + "".join(f"[{footnote_index[cid]}]" for cid in c["chunk_ids"])
+        for c in citations
     )
 
-@tool
-def search_papers(query: str) -> str:
-    """Search the local materials-science PDF collection for relevant passages.
-    Use this BEFORE web_search for materials property prediction questions —
-    these are peer-reviewed papers, not web pages."""
-    if _vectorstore is None:
-        return "Paper search unavailable: add PDFs to the 'papers/' directory first."
-    retriever = _vectorstore.as_retriever(search_kwargs={"k": 4})
-    return _format_docs(retriever.invoke(query)) or "No relevant passages found."
+    lookup = state["chunk_lookup"]
+    lines = [prose, "", "---", "**Sources**"]
+    for cid in footnote_order:
+        rec = lookup.get(cid, {})
+        snippet = rec.get("text", "").replace("\n", " ").strip()[:180]
+        lines.append(f"{footnote_index[cid]}. `{cid}` — *{rec.get('paper', '?')}*, p.{rec.get('page', '?')}: “{snippet}…”")
 
-# ── Agent ─────────────────────────────────────────────────────────────────────
+    flagged = [c for c in citations if c["verdict"] != "supported"]
+    if flagged:
+        lines += ["", "**⚠️ Flagged** — a citation exists but the wording overreaches the source:"]
+        lines += [f"- *{c['verdict']}*: “{c['claim']}” — {c['explanation']}" for c in flagged]
+    else:
+        lines += ["", f"✅ All {len(citations)} claim(s) verified against their cited sources."]
 
-_today = datetime.now(timezone.utc)
-_tools = [calculator, get_paper_abstract, get_current_time,
-          remember_finding, recall_findings, search_papers]
-_system_prompt = (
-    f"Today's date is {_today:%Y-%m-%d}. "
-    "You are a materials-research assistant. "
-    "Use calculator for arithmetic, web_search for current facts, "
-    "get_paper_abstract for named arXiv papers, search_papers for the local PDF corpus, "
-    "and remember_finding / recall_findings to persist insights across sessions."
-)
+    return "\n".join(lines)
 
-_checkpointer = InMemorySaver()
 
-agent = create_agent(
-    model=llm,
-    tools=_tools,
-    system_prompt=_system_prompt,
-    checkpointer=_checkpointer,
-    store=_store,
-)
+def _contextualize(history: list[tuple[str, str]], new_message: str) -> str:
+    """Fold recent turns into the question so follow-ups ('what about the other
+    paper?') retrieve sensibly — the graph itself is stateless per question."""
+    if not history:
+        return new_message
+    ctx = "\n".join(f"Q: {q}\nA: {a}" for q, a in history)
+    return f"Prior conversation:\n{ctx}\n\nNew question: {new_message}"
 
-# ── Chainlit UI ───────────────────────────────────────────────────────────────
 
+# ── Chainlit UI ────────────────────────────────────────────────────────────────
 @cl.on_chat_start
 async def on_chat_start():
-    cl.user_session.set("thread_id", str(uuid.uuid4()))
+    cl.user_session.set("history", [])
+    data = agentic_rag.vectorstore.get(include=["metadatas"])
+    papers = sorted({md.get("source", "?").split("/")[-1].replace(".pdf", "") for md in data["metadatas"]})
     await cl.Message(
         content=(
-            "**Materials Research Assistant** ready.\n\n"
-            "I can: calculate, search the web, look up arXiv papers, "
-            "search local PDFs, and remember findings across turns."
+            "**Materials-Science Paper Chat**\n\n"
+            "Ask a question and I'll retrieve, grade, and — if needed — re-retrieve "
+            "before answering. Every claim cites the exact chunk it came from, and "
+            "each citation is checked against that chunk before you see it.\n\n"
+            f"Loaded papers: {', '.join(papers)}"
         )
     ).send()
 
 
 @cl.on_message
 async def on_message(message: cl.Message):
-    thread_id = cl.user_session.get("thread_id")
-    cfg = {"configurable": {"thread_id": thread_id}}
+    history = cl.user_session.get("history", [])
+    question = _contextualize(history, message.content)
+    cfg = {"configurable": {"thread_id": str(uuid.uuid4())}}
+    initial_state = {
+        "question": question, "query": question, "queries_tried": [],
+        "iteration": 0, "max_iterations": agentic_rag.MAX_ITERATIONS,
+        "retrieved_docs": [], "graded_ids": [], "relevant_docs": [], "chunk_lookup": {},
+        "gap": {}, "claims": [], "answer": "", "citations": [],
+    }
 
-    pending_steps: dict[str, cl.Step] = {}
-    answer = cl.Message(content="")
+    async for update in _graph.astream(initial_state, stream_mode="updates", config=cfg):
+        for node_name, node_output in update.items():
+            step_input, step_output = _describe(node_name, node_output)
+            step = cl.Step(
+                name=_STEP_LABEL.get(node_name, node_name),
+                type=_STEP_TYPE.get(node_name, "run"),
+            )
+            step.input = step_input
+            step.output = step_output
+            await step.send()
 
-    async for update in agent.astream(
-        {"messages": [{"role": "user", "content": message.content}]},
-        stream_mode="updates",
-        config=cfg,
-    ):
-        for node_output in update.values():
-            for msg in node_output.get("messages", []):
-                if msg.type == "ai":
-                    for tc in msg.tool_calls or []:
-                        step = cl.Step(name=tc["name"], type="tool")
-                        step.input = tc["args"]
-                        await step.send()
-                        pending_steps[tc["id"]] = step
-                    if isinstance(msg.content, str) and msg.content.strip():
-                        await answer.stream_token(msg.content)
-                elif msg.type == "tool":
-                    step = pending_steps.pop(msg.tool_call_id, None)
-                    if step:
-                        content = (
-                            msg.content if isinstance(msg.content, str)
-                            else str(msg.content)
-                        )
-                        step.output = content[:1000]
-                        await step.update()
+    final_state = (await _graph.aget_state(cfg)).values
+    await cl.Message(content=_format_answer(final_state)).send()
 
-    await answer.send()
+    history.append((message.content, final_state["answer"]))
+    cl.user_session.set("history", history[-3:])
 
 
 # ── expose ASGI app for uvicorn ───────────────────────────────────────────────
