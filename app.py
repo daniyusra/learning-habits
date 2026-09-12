@@ -4,7 +4,10 @@
 # retrieve -> grade -> gap-check -> generate -> verify loop (agentic_rag.py) as
 # an inspectable Step, with every claim in the final answer showing its verdict
 # from the faithfulness check. Research Pipeline streams the literature ->
-# route -> synthesis handoff (research_pipeline.py) the same way.
+# route -> synthesis -> human_review handoff (research_pipeline.py) the same
+# way, including the real interrupt() pause at human_review: the graph stops
+# mid-run, this app asks the reviewer in-chat, then resumes on the SAME
+# thread_id with Command(resume=...) — see _finish_pipeline_turn.
 # Run: uv run uvicorn app:app --reload
 
 import pysqlite3 as _pysqlite3  # chromadb needs this on some systems
@@ -17,6 +20,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import chainlit as cl
+from langgraph.types import Command
 
 import agentic_rag
 import research_pipeline
@@ -132,13 +136,13 @@ _PIPELINE_STEP_TYPE = {
     "literature": "tool",
     "synthesis": "llm",
     "end_no_papers": "run",
-    "human_review_stub": "run",
+    "human_review": "run",
 }
 _PIPELINE_STEP_LABEL = {
     "literature": "Agent 1 — literature search",
     "synthesis": "Agent 2 — synthesize hypotheses",
     "end_no_papers": "no relevant papers — stopping",
-    "human_review_stub": "human review (stub — no-op today)",
+    "human_review": "human review — approve / edit / reject",
 }
 
 
@@ -166,8 +170,11 @@ def _describe_pipeline(node_name: str, out: dict) -> tuple[str, str]:
     if node_name == "end_no_papers":
         return "route: is there anything to synthesize from?", out["status"]
 
-    if node_name == "human_review_stub":
-        return "", "stub — no-op; Wednesday's human-in-the-loop gate slots in here"
+    if node_name == "human_review":
+        return (
+            "apply the reviewer's approve/edit/reject decision",
+            f"{len(out['hypotheses'])} hypothesis(es) kept  (status: {out['status']})",
+        )
 
     return "", str(out)
 
@@ -193,12 +200,16 @@ def _format_pipeline_answer(state: dict) -> str:
             f"  method: {s['method']} · finding: {s['relevant_finding']} · source: {s['source_citation']}"
         )
 
-    lines += ["", "**Proposed hypotheses** (Agent 2 — grounded only in the findings above)"]
-    for i, h in enumerate(hypotheses, 1):
-        lines.append(f"{i}. **{h['hypothesis']}**")
-        lines.append(f"   - variables: {', '.join(h['variables'])}")
-        lines.append(f"   - expected outcome: {h['expected_outcome']}")
-        lines.append(f"   - confidence (self-reported, not calibrated): {h['confidence']:.2f}")
+    lines += ["", "**Hypotheses after human review** (Agent 2's proposals, as you approved/edited/rejected them)"]
+    if not hypotheses:
+        lines.append("_None — every hypothesis was rejected in review._")
+    else:
+        for i, h in enumerate(hypotheses, 1):
+            lines.append(f"{i}. **{h['hypothesis']}**")
+            lines.append(f"   - variables: {', '.join(h['variables'])}")
+            lines.append(f"   - expected outcome: {h['expected_outcome']}")
+            lines.append(f"   - confidence (self-reported, not calibrated): {h['confidence']:.2f}")
+    lines += ["", f"_status: {status}_"]
 
     return "\n".join(lines)
 
@@ -311,14 +322,15 @@ async def _run_paper_chat(message: cl.Message):
     cl.user_session.set("history", history[-3:])
 
 
-async def _run_research_pipeline(message: cl.Message):
-    # Fresh thread_id per question by default (see research_pipeline.run_pipeline) —
-    # this is a one-shot pipeline per question, not a running conversation.
-    cfg = {"configurable": {"thread_id": str(uuid.uuid4())}}
-    initial_state = {"question": message.content}
-
-    async for update in _pipeline_graph.astream(initial_state, stream_mode="updates", config=cfg):
+async def _stream_pipeline_steps(stream) -> dict | None:
+    """Send each research-pipeline node's output as a Step. If the graph pauses
+    at human_review (a real interrupt(), not a stub), returns the interrupt's
+    payload dict instead of None so the caller can run the review; otherwise
+    the graph ran to END and there's nothing further to resume."""
+    async for update in stream:
         for node_name, node_output in update.items():
+            if node_name == "__interrupt__":
+                return node_output[0].value
             step_input, step_output = _describe_pipeline(node_name, node_output)
             step = cl.Step(
                 name=_PIPELINE_STEP_LABEL.get(node_name, node_name),
@@ -327,6 +339,45 @@ async def _run_research_pipeline(message: cl.Message):
             step.input = step_input
             step.output = step_output
             await step.send()
+    return None
+
+
+async def _run_research_pipeline(message: cl.Message):
+    # Fresh thread_id per question by default (see research_pipeline.run_pipeline) —
+    # this is a one-shot pipeline per question, not a running conversation. It's
+    # ALSO the thread_id the human_review interrupt (if hit) must be resumed on.
+    cfg = {"configurable": {"thread_id": str(uuid.uuid4())}}
+    stream = _pipeline_graph.astream({"question": message.content}, stream_mode="updates", config=cfg)
+    interrupt_payload = await _stream_pipeline_steps(stream)
+    await _finish_pipeline_turn(cfg, interrupt_payload)
+
+
+async def _finish_pipeline_turn(cfg: dict, interrupt_payload: dict | None):
+    if interrupt_payload is not None:
+        hyps = interrupt_payload["hypotheses"]
+        lines = ["**Human review — approve, edit, or reject each hypothesis**", ""]
+        for i, h in enumerate(hyps, 1):
+            lines.append(f"{i}. {h['hypothesis']}  _(confidence: {h['confidence']:.2f})_")
+        lines += [
+            "",
+            "Reply with the ones to keep — comma-separated numbers (e.g. `1,3`), "
+            "`2: replacement text` to edit one before approving, `all` to approve "
+            "everything unchanged, or `none` to reject everything.",
+        ]
+        reply = await cl.AskUserMessage(content="\n".join(lines), timeout=300).send()
+        reply_text = reply["output"] if reply else "none"
+        status = "reviewed" if reply else "review timed out — treated as reject"
+
+        approved = research_pipeline.apply_review_decision(hyps, reply_text)
+        # Resume the SAME thread_id the interrupt paused on — a different one
+        # (or a corrupted checkpoint) is exactly the gotcha research_pipeline.py
+        # warns about in human_review_node's docstring.
+        resume_stream = _pipeline_graph.astream(
+            Command(resume={"approved_hypotheses": approved, "status": status}),
+            stream_mode="updates", config=cfg,
+        )
+        # human_review -> END is the only path left, so this can't hit another interrupt.
+        await _stream_pipeline_steps(resume_stream)
 
     final_state = (await _pipeline_graph.aget_state(cfg)).values
     await cl.Message(content=_format_pipeline_answer(final_state)).send()
