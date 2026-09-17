@@ -5,3 +5,4 @@ __pycache__/
 papers/
 chroma_db/
 .chainlit/
+data/
