@@ -1,0 +1,109 @@
+# NequIP 0.19.1 on sGDML CCSD(T) ethanol (the MD17 ethanol trajectory, recomputed at CCSD(T)).
+# Adapted from nequip's own minimal_aspirin.yaml test config. Units are as in the dataset:
+# energy in kcal/mol, forces in kcal/mol/Å (this datamodule does not convert to eV).
+#
+# Run from the repo root:
+#   .venv/bin/nequip-train -cp $PWD/nequip-md17 -cn ethanol.yaml
+# Short smoke test:
+#   .venv/bin/nequip-train -cp $PWD/nequip-md17 -cn ethanol.yaml trainer.max_epochs=2
+
+run: [train, test]
+
+seed: 1
+cutoff_radius: 4.0                  # ethanol is ~4 Å across, so this is nearly all pairs
+model_type_names: [C, O, H]
+chemical_species: ${model_type_names}
+
+dataloader:
+  _target_: torch.utils.data.DataLoader
+  batch_size: 5
+
+data:
+  _target_: nequip.data.datamodule.sGDML_CCSD_DataModule
+  dataset: ethanol
+  data_source_dir: ${hydra:runtime.cwd}/nequip-md17/data
+  transforms:
+    - _target_: nequip.data.transforms.ChemicalSpeciesToAtomTypeMapper
+      model_type_names: ${model_type_names}
+      chemical_species_to_atom_type_map: ${list_to_identity_dict:${chemical_species}}
+    - _target_: nequip.data.transforms.NeighborListTransform
+      r_max: ${cutoff_radius}
+  train_val_split: [950, 50]        # the 1000-frame training file; the separate 1000-frame test file is the test set
+  seed: ${seed}
+  train_dataloader: ${dataloader}
+  val_dataloader: ${dataloader}
+  test_dataloader: ${dataloader}
+  stats_manager:
+    _target_: nequip.data.CommonDataStatisticsManager
+    type_names: ${model_type_names}
+    dataloader_kwargs:
+      batch_size: 50
+
+trainer:
+  _target_: lightning.Trainer
+  accelerator: gpu
+  devices: 1
+  max_epochs: 200
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 50
+  logger:
+    _target_: lightning.pytorch.loggers.CSVLogger
+    save_dir: ${hydra:runtime.output_dir}
+  callbacks:
+    - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+      monitor: val0_epoch/weighted_sum
+      dirpath: ${hydra:runtime.output_dir}
+      filename: best
+      save_top_k: 1
+      save_last: true
+    - _target_: lightning.pytorch.callbacks.EarlyStopping
+      monitor: val0_epoch/weighted_sum
+      patience: 40
+    - _target_: nequip.train.callbacks.TestTimeXYZFileWriter
+      out_file: ${hydra:runtime.output_dir}/test
+      output_fields_from_original_dataset: [total_energy, forces]
+      chemical_symbols: ${chemical_species}
+
+training_module:
+  _target_: nequip.train.EMALightningModule
+  loss:
+    _target_: nequip.train.EnergyForceLoss
+    per_atom_energy: true
+    coeffs:
+      total_energy: 1.0
+      forces: 1.0
+  val_metrics:
+    _target_: nequip.train.EnergyForceMetrics
+    coeffs:
+      total_energy_mae: 1.0
+      forces_mae: 1.0
+  test_metrics: ${training_module.val_metrics}
+  optimizer:
+    _target_: torch.optim.Adam
+    lr: 0.01
+  lr_scheduler:
+    scheduler:
+      _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
+      factor: 0.6
+      patience: 10
+      threshold: 0.01
+      min_lr: 1.0e-5
+    monitor: val0_epoch/weighted_sum
+    interval: epoch
+    frequency: 1
+  model:
+    _target_: nequip.model.NequIPGNNModel
+    seed: ${seed}
+    model_dtype: float32
+    type_names: ${model_type_names}
+    r_max: ${cutoff_radius}
+    l_max: 1                        # NequIP default; the walkthrough's lmax story applies
+    parity: true                    # carries 0e, 0o, 1o, 1e features
+    num_layers: 3
+    num_features: 32
+    radial_mlp_depth: 1
+    radial_mlp_width: 64
+    # data-dependent: measured from the training split, per species (quiz Q3)
+    avg_num_neighbors: ${training_data_stats:per_type_num_neighbors_mean}
+    per_type_energy_shifts: ${training_data_stats:per_atom_energy_mean}
+    per_type_energy_scales: ${training_data_stats:per_type_forces_rms}

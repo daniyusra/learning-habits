@@ -13,6 +13,7 @@ dependencies = [
     "langchain-tavily>=0.2.18",
     "langchain-text-splitters>=1.1.2",
     "matplotlib>=3.11.0",
+    "nequip==0.19.1",
     "networkx>=3.6.1",
     "numpy>=2.4.6",
     "pandas>=3.0.3",
@@ -33,3 +34,11 @@ dev = [
     "jupyterlab>=4.6.0",
     "notebook>=7.6.0",
 ]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
