@@ -6,3 +6,4 @@ papers/
 chroma_db/
 .chainlit/
 data/
+splitting.lock

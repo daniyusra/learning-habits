@@ -1,0 +1,6 @@
+.venv-mace/
+.venv-schnet/
+runs/
+# NequIP setup: smoke-tested 2026-10-24, not yet in the benchmark
+scripts/train_nequip.py
+configs/nequip.yaml
